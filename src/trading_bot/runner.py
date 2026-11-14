@@ -17,6 +17,7 @@ from .db import Database
 from .execution import PaperBroker, load_portfolio, reconcile
 from .features import build_features
 from .models import interval_ms, now_ms
+from .ops import FeedWatcher
 from .portfolio import Portfolio
 from .research import check_config_freeze, config_hash
 from .risk import RiskManager, utc_day
@@ -40,6 +41,7 @@ class Runner:
         self.feed: LiveFeed | None = None
         self.kill_handled = False
         self.was_stale = False
+        self.watcher = FeedWatcher(self.db)
         self.last_mark = None
         self._stop = False
 
@@ -51,6 +53,7 @@ class Runner:
                else f"Settings match the frozen paper config (id {config_hash(cfg)})")
         db.conn.execute("INSERT INTO runs(started_ms,profile,strategy_version,config_json) VALUES(?,?,?,?)",
                         (now_ms(), cfg.profile, self.strat.version, str(cfg.raw)))
+        db.log_event("INFO", "run_start", f"strategy {self.strat.version}, settings {config_hash(cfg)}")
         log.ok(f"Starting paper trading: {self.sym}, profile '{cfg.profile}', strategy {self.strat.version}")
         log.note("Paper trading = pretend money, real prices. No real orders are ever sent.")
         self._restore_state()
@@ -113,6 +116,7 @@ class Runner:
         if self.feed:
             self.feed.stop()
         self._save_state()
+        self.db.log_event("INFO", "run_stop", "stopped safely")
         log.ok("Stopped safely. Account and position are saved; restart any time to continue.")
         self.db.close()
 
@@ -162,6 +166,8 @@ class Runner:
         if not stale and self.was_stale:
             log.ok("Market data is fresh again")
         self.was_stale = stale
+        if self.feed:
+            self.watcher.check(self.feed, stale)
 
     def _watch_price(self):
         """Between candles: exit quickly if the live price crosses stop or target."""
@@ -192,6 +198,7 @@ class Runner:
         cfg, db = self.cfg, self.db
         gaps = db.find_gaps(self.sym, self.entry_iv, candle.start - 200 * interval_ms(self.entry_iv))
         if gaps:
+            db.log_event("WARN", "gap_repair", f"{len(gaps)} missing {self.entry_iv}m candle(s)")
             repair_gaps(self.client, db, self.sym, self.entry_iv)
         entry = db.load_candles(self.sym, self.entry_iv, limit=cfg.data.warmup_candles)
         trend = db.load_candles(self.sym, self.trend_iv, limit=cfg.data.warmup_candles)
@@ -255,8 +262,13 @@ class Runner:
             self.risk.record_order()
             return {"position": asdict(self.pos), "risk": self.risk.to_dict()}
 
-        self.broker.submit(f"BUY-{self.sym}-{candle.start}", "BUY", qty, mid, q,
-                           reason="strategy entry", decision_id=decision_id, extra_state=after)
+        res = self.broker.submit(f"BUY-{self.sym}-{candle.start}", "BUY", qty, mid, q,
+                                 reason="strategy entry", decision_id=decision_id, extra_state=after)
+        self._note_duplicate(res)
+
+    def _note_duplicate(self, res):
+        if res.status == "DUPLICATE":
+            self.db.log_event("WARN", "order_duplicate", "an order with the same id was blocked")
 
     def _exit(self, reason: str, code: str, quote=None):
         if not self.pos:
@@ -273,6 +285,7 @@ class Runner:
 
         res = self.broker.submit(f"SELL-{self.sym}-{pos.entry_start}-{code}", "SELL", pos.qty, mid, q,
                                  reason=reason, extra_state=after)
+        self._note_duplicate(res)
         if res.status == "FILLED":
             f = res.fill
             log.ok(f"Trade closed: profit before costs {f.realized_gross:+.4f}, after costs {f.realized_net:+.4f} USDT")

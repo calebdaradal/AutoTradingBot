@@ -175,10 +175,10 @@ def split_ranges(n: int, cfg):
 
 
 def run_backtest(entry, trend, cfg, start_equity: float, lo: int = 0, hi: int | None = None,
-                 label: str = "full", feats=None) -> Result:
+                 label: str = "full", feats=None, strat=None) -> Result:
     hi = len(entry) if hi is None else hi
     feats = feats or build_features(entry, trend, cfg.strategy, cfg.data.entry_interval, cfg.data.trend_interval)
-    strat = TrendMomentum(cfg.strategy)
+    strat = strat or TrendMomentum(cfg.strategy)   # default = the v1.0 baseline rules
     pf = Portfolio(start_equity, cfg.costs, cfg.exchange_rules)
     risk = RiskManager(cfg.risk, cfg.exchange_rules)
     res = Result(label, entry[lo].start, entry[hi - 1].start, start_equity, start_equity)

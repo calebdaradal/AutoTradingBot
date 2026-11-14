@@ -99,9 +99,31 @@ Legend: **FINISHED** = built and tested. **NEXT** = work to do now. **NOT DONE**
 - History expanded to 730 days (70,080 x 15m candles, 0 gaps). Backtest now uses the first 75% (548 days).
 - **v1.0 on 2 years of data (train/validation only):** train -14.78% (buy-and-hold +4.24%), validation -13.81% (buy-and-hold -16.76%). Profit factor 0.41 / 0.18. Still FAILED. Final test not taken yet.
 
+## Two tracks running in parallel (M7 + strategy research)
+The two tracks are kept apart on purpose. The paper run always uses frozen v1.0. New ideas are backtest-only and never touch `config/base.yaml`.
+
+### Track A - Operational validation (`ops.py`)
+- `run` freezes settings; the runner is hard-wired to v1.0.
+- Journal events record: run start/stop (restarts), feed reconnects, duplicate and out-of-order candles, stale data, gap repairs, duplicate-order blocks.
+- `ops` report: days running (gate: 30 days AND 30 closed trades), restarts, missed candles, feed health, orders and rejections, real slippage vs modeled, config-frozen check.
+- **Caveat:** two short test runs happened before the freeze feature existed. `ops` may show "2 days" and "missed candles" from them. The clean 30-day clock starts at the first real `run` (which freezes settings). Journal rows are immutable, so they are not deleted.
+
+### Track B - Strategy research (`candidates.py`, `hypotheses.py`, `diagnose.py`)
+- v1.0 (`trend_momentum-1.0`) is a permanent failed baseline: it cannot be re-registered as a candidate or get a final test.
+- `diagnose`: facts only about why v1.0 loses (exit reasons, losers that were up first, cost drag, entry snapshots).
+- One hypothesis at a time. Pass marks (trades, return, profit factor, drawdown) are fixed when it is written.
+- A candidate is a new class registered with `@candidate("trend_momentum-1.1")`. Backtest-only.
+- `backtest --candidate X` tests train + validation (and cost stress), saves every run, and marks the hypothesis QUALIFIED_CANDIDATE or REJECTED. A rejected idea cannot be re-judged; write a new one with a new version.
+- `final-check --candidate X --confirm` works only for a QUALIFIED_CANDIDATE and only once per candidate.
+- Promotion to paper needs a deliberate `refreeze` and starts a new 30-day clock.
+- Tests: 85 passing.
+
+### Workflow
+`diagnose` -> register candidate class -> `hypothesis add` -> `backtest --candidate X` -> (if qualified) `final-check --candidate X --confirm`.
+
 ## Next to implement
-1. **Start the paper run now** and leave it running (see commands). Do not change rules during the 30 days.
-2. In parallel, **fix the strategy hypothesis** (M5 gate). Ideas: stricter entry, no-trade filter for choppy markets, different timeframe. Record every version, including failures.
+1. **Start the paper run now** and leave it running. Do not change rules during the 30 days. Check with `ops` and `status`.
+2. Write the first hypothesis from the `diagnose` facts. Record every version, including failures.
 3. `verdict` in the report says "TOO EARLY" until 30 days and 30 trades.
 4. Only after a profitable, out-of-sample result: consider M8+.
 
@@ -113,6 +135,11 @@ Run from the project folder using `.venv\Scripts\python.exe -m trading_bot <comm
 | `sync` | Download/refresh candle history |
 | `backtest` | Test on past data (train + validation only; final test stays locked). Every run is saved |
 | `final-check` | Show whether the final test can be taken; add `--confirm` to take it. Allowed once per settings + dates |
+| `ops` | Track A report: paper-run health, 30-day gate status |
+| `diagnose` | Track B facts: why v1.0 loses |
+| `hypothesis add/list/close` | Track B: one idea at a time with fixed pass marks |
+| `backtest --candidate X` | Test a candidate on train + validation |
+| `final-check --candidate X` | Final test for a qualified candidate (once) |
 | `experiments` | List saved backtest receipts (settings, data fingerprint, code version, results) |
 | `refreeze --reason "why"` | Accept changed settings for paper trading (treat as a new experiment) |
 | `run` | Start paper trading (live prices, fake money) |

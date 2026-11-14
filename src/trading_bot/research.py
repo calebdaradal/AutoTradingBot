@@ -90,14 +90,17 @@ def recent_experiments(db, limit=15):
 
 
 # ------------------------------------------------------------------ protected final test
-def check_final_test(db, cfg, test_start_ms, test_end_ms) -> dict:
+def check_final_test(db, cfg, test_start_ms, test_end_ms, strategy_version=None) -> dict:
     """Decide if the final exam may be taken now. Raises FinalTestError if not allowed.
-    Returns {'prior_looks': n} - how many times these test dates were already used."""
+    Returns {'prior_looks': n} - how many times these test dates were already used.
+    Same settings AND same strategy version (when given) count as 'the same setup'."""
     chash = config_hash(cfg)
     prior = db.conn.execute(
-        "SELECT config_hash, data_start_ms, data_end_ms FROM experiments WHERE kind='final_test'").fetchall()
+        "SELECT config_hash, strategy_version, data_start_ms, data_end_ms FROM experiments "
+        "WHERE kind='final_test'").fetchall()
     overlapping = [p for p in prior if p["data_start_ms"] <= test_end_ms and p["data_end_ms"] >= test_start_ms]
-    if any(p["config_hash"] == chash for p in overlapping):
+    if any(p["config_hash"] == chash and (strategy_version is None or p["strategy_version"] == strategy_version)
+           for p in overlapping):
         raise FinalTestError("The final test was already taken for these exact settings and dates. "
                              "Re-running it would not be honest. Change the strategy version and get "
                              "fresh data first.")

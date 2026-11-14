@@ -2,11 +2,15 @@
 
   sync         download recent price history and check it for gaps
   backtest     replay the strategy on past data (train + validation + stress tests). The final test is LOCKED
-  final-check  take the locked final test (once per setup; needs --confirm)
+                 --candidate <version> tests a new idea (needs a written hypothesis first)
+  diagnose     facts about why the v1.0 baseline loses (reads its saved backtests)
+  hypothesis   add / list / close ideas. One at a time, written down before testing
+  final-check  take the locked final test (needs --candidate and --confirm; only for a qualified candidate)
   experiments  list the saved receipts of past backtests
   run          start paper trading (fake money, real prices). Settings are frozen on first start
   refreeze     accept changed settings for the paper run (needs --reason)
   status       show how the paper run is doing
+  ops          health check of the paper run itself (feed, orders, missed candles, fill costs)
   kill         emergency stop: block new buys and close any open position
   resume       clear the emergency stop / drawdown halt
   dashboard    open the visual dashboard (browser)
@@ -49,13 +53,23 @@ def _load_history(cfg, db):
 def cmd_backtest(cfg, a):
     from .backtest import run_backtest, split_ranges, with_overrides
     from .research import dataset_info, record_experiment
+    from . import hypotheses as hy
+    from .candidates import build_candidate
     from .strategies import TrendMomentum
     db = Database(cfg.data.db_path)
+    strat, hyp = None, None
+    if a.candidate:                                  # a new idea: must be written down first, and still untested
+        hyp = hy.open_hypothesis(db)
+        if not hyp or hyp["candidate"] != a.candidate or hyp["state"] != "DRAFT":
+            raise hy.HypothesisError(f"No untested hypothesis exists for {a.candidate}. "
+                                     f"Write it first with 'hypothesis add' (one idea at a time).")
+        strat = build_candidate(a.candidate, cfg.strategy)
+        log.note(f"Testing candidate {strat.version} for hypothesis {hyp['id']}: {hyp['title']}")
     hist = _load_history(cfg, db)
     if not hist:
         return
     entry, trend, feats = hist
-    start, version = starting_balance_usdt(cfg), TrendMomentum(cfg.strategy).version
+    start, version = starting_balance_usdt(cfg), (strat or TrendMomentum(cfg.strategy)).version
     ranges = split_ranges(len(entry), cfg)
     dev_hi = ranges["validation"][1]           # everything BEFORE the locked final test
     batch = now_ms()
@@ -65,22 +79,32 @@ def cmd_backtest(cfg, a):
 
     def save(kind, label, r, trades=True):
         record_experiment(db, kind=kind, label=label, cfg=cfg, strategy_version=version, dataset=ds,
-                          result=r, batch=batch, include_trades=trades)
+                          result=r, batch=batch, include_trades=trades,
+                          note=f"hypothesis={hyp['id']}" if hyp else "")
 
+    dev = {}
     for name in ("train", "validation"):
         lo, hi = ranges[name]
-        r = run_backtest(entry, trend, cfg, start, lo, hi, name, feats)
+        r = run_backtest(entry, trend, cfg, start, lo, hi, name, feats, strat=strat)
+        dev[name] = r.metrics()
         save("backtest", name, r)
         for line in r.summary_lines():
             log.note(line)
     log.note("--- Stress test: what if trading costs are higher? (train + validation) ---")
     for mult in (1.0, 2.0, 3.0):
-        r = run_backtest(entry, trend, with_overrides(cfg, cost_mult=mult), start, 0, dev_hi, f"costs x{mult:g}", feats)
+        r = run_backtest(entry, trend, with_overrides(cfg, cost_mult=mult), start, 0, dev_hi, f"costs x{mult:g}", feats,
+                         strat=strat)
         save("stress", f"costs x{mult:g}", r, trades=False)
         log.note(f"costs x{mult:g}: result {r.net_return:+.2%}, {len(r.trades)} trades, max drop {r.max_drawdown:.2%}")
         if mult == 1.0 and r.blocked:
             log.note("  Most common blocks: " + ", ".join(f"{k} ({v})" for k, v in
                                                           sorted(r.blocked.items(), key=lambda x: -x[1])[:3]))
+    if hyp:
+        done = hy.record_dev_results(db, hyp["id"], dev)
+        why = done["history"][-1]["reason"]
+        (log.ok if done["state"] == "QUALIFIED_CANDIDATE" else log.warn)(f"{hyp['id']} is now {done['state']}: {why}")
+        log.note("Candidates are not sensitivity-tested here; that is a later robustness step.")
+        return
     log.note("--- Sensitivity: do small setting changes flip the result? (train + validation) ---")
     from .features import build_features
     s = cfg.strategy
@@ -100,28 +124,75 @@ def cmd_backtest(cfg, a):
 
 def cmd_final_check(cfg, a):
     from .backtest import run_backtest, split_ranges
+    from . import hypotheses as hy
+    from .candidates import build_candidate
     from .research import check_final_test, dataset_info, record_experiment
-    from .strategies import TrendMomentum
     db = Database(cfg.data.db_path)
+    hyp = hy.require_final_ready(db, a.candidate)      # raises unless a QUALIFIED_CANDIDATE is waiting (never v1.0)
+    strat = build_candidate(a.candidate, cfg.strategy)
     hist = _load_history(cfg, db)
     if not hist:
         return
     entry, trend, feats = hist
     lo, hi = split_ranges(len(entry), cfg)["test"]
-    check = check_final_test(db, cfg, entry[lo].start, entry[hi - 1].start)   # raises if not allowed
+    check = check_final_test(db, cfg, entry[lo].start, entry[hi - 1].start, strat.version)   # raises if not allowed
+    log.note(f"Candidate {strat.version} ({hyp['id']}: {hyp['title']}) passed train + validation. "
+             f"Pass marks were fixed in advance: {hyp['thresholds']}")
     log.warn(f"FINAL TEST: {hi - lo} candles ({(hi - lo) / 96:.0f} days). Look at this once; do not tweak settings afterwards.")
     if check["prior_looks"]:
         log.warn(f"These dates were already used {check['prior_looks']} time(s) for other settings, so this result is less trustworthy.")
     if not a.confirm:
         log.note("Nothing was run. To take the final test, run: final-check --confirm")
         return
-    r = run_backtest(entry, trend, cfg, starting_balance_usdt(cfg), lo, hi, "final test", feats)
-    record_experiment(db, kind="final_test", label="final test", cfg=cfg,
-                      strategy_version=TrendMomentum(cfg.strategy).version, dataset=dataset_info(entry[lo:hi]),
-                      result=r, batch=now_ms(), note=f"prior_looks={check['prior_looks']}")
+    r = run_backtest(entry, trend, cfg, starting_balance_usdt(cfg), lo, hi, "final test", feats, strat=strat)
+    exp_id = record_experiment(db, kind="final_test", label="final test", cfg=cfg,
+                               strategy_version=strat.version, dataset=dataset_info(entry[lo:hi]),
+                               result=r, batch=now_ms(),
+                               note=f"hypothesis={hyp['id']} prior_looks={check['prior_looks']}")
     for line in r.summary_lines():
         log.note(line)
-    log.ok("Final test taken and saved. It is now used up for these settings.")
+    done = hy.record_final_result(db, hyp["id"], r.metrics(), exp_id)
+    (log.ok if done["final"]["passed"] else log.warn)(f"Final test taken and saved. {hyp['id']} is now {done['state']}: "
+                                                      f"{done['history'][-1]['reason']}")
+
+
+def cmd_diagnose(cfg, a):
+    from .diagnose import BASELINE_VERSION, diagnose_trades, load_trades, print_diagnosis
+    version = a.version or BASELINE_VERSION
+    c = cfg.costs
+    round_trip = 2 * (c.taker_fee + c.half_spread + c.slippage)
+    log.note(f"Why does {version} lose? Facts from its saved backtests (a round trip costs about {round_trip:.2%} of price).")
+    trades = load_trades(Database(cfg.data.db_path), version)
+    for label, t in trades.items():
+        print_diagnosis(label, diagnose_trades(t, round_trip), log.note)
+    log.ok("Diagnosis done. These are measurements, not explanations. Ideas go in 'hypothesis add'.")
+
+
+def cmd_hypothesis(cfg, a):
+    from . import hypotheses as hy
+    db = Database(cfg.data.db_path)
+    if a.action == "add":
+        for need in ("title", "statement", "prediction", "candidate"):
+            if not getattr(a, need):
+                raise hy.HypothesisError(f"--{need} is required")
+        h = hy.add_hypothesis(db, title=a.title, statement=a.statement, prediction=a.prediction,
+                              candidate=a.candidate, min_profit_factor=a.min_pf, min_trades=a.min_trades,
+                              min_return=a.min_return)
+        log.ok(f"{h['id']} written down (DRAFT). Pass marks are now fixed: {h['thresholds']}. "
+               f"Next: backtest --candidate {h['candidate']}")
+    elif a.action == "close":
+        if not a.id:
+            raise hy.HypothesisError("--id is required")
+        h = hy.close_hypothesis(db, a.id, a.reason)
+        log.ok(f"{h['id']} closed as {h['state']}: {a.reason}")
+    else:
+        items = hy.list_hypotheses(db)
+        for h in items:
+            log.note(f"{h['id']} [{h['state']}] {h['title']} | candidate {h['candidate']}")
+            log.note(f"   idea: {h['statement']}")
+            log.note(f"   expected: {h['prediction']}")
+            log.note(f"   last step: {h['history'][-1]['reason']}")
+        log.ok(f"{len(items)} hypothesis(es) on file" if items else "No hypotheses yet. Add one with 'hypothesis add'")
 
 
 def cmd_experiments(cfg, a):
@@ -161,6 +232,12 @@ def cmd_status(cfg, a):
     log.note(f"Emergency stop: {'ON' if db.get_state('kill_switch', False) else 'off'}")
 
 
+def cmd_ops(cfg, a):
+    from .ops import ops_report, print_ops
+    print_ops(ops_report(Database(cfg.data.db_path), cfg), log.note)
+    log.ok("Ops report done")
+
+
 def cmd_kill(cfg, a):
     Database(cfg.data.db_path).set_state("kill_switch", True)
     log.warn("Emergency stop set. The running bot will close any open position and stop buying.")
@@ -187,10 +264,22 @@ def main(argv=None):
     p.add_argument("--profile", default=DEFAULT_PROFILE, choices=PROFILES)
     sub = p.add_subparsers(dest="cmd", required=True)
     s = sub.add_parser("sync"); s.add_argument("--days", type=float, default=180); s.set_defaults(fn=cmd_sync)
-    sub.add_parser("backtest").set_defaults(fn=cmd_backtest)
+    b = sub.add_parser("backtest")
+    b.add_argument("--candidate", default=None, help="test a new strategy version (needs an open hypothesis for it)")
+    b.set_defaults(fn=cmd_backtest)
     f = sub.add_parser("final-check")
+    f.add_argument("--candidate", required=True, help="strategy version to test; it must be a QUALIFIED_CANDIDATE")
     f.add_argument("--confirm", action="store_true", help="really take the final test (it can only be used once)")
     f.set_defaults(fn=cmd_final_check)
+    h = sub.add_parser("hypothesis")
+    h.add_argument("action", choices=["add", "list", "close"])
+    h.add_argument("--id"); h.add_argument("--reason", default="")
+    h.add_argument("--title"); h.add_argument("--statement"); h.add_argument("--prediction")
+    h.add_argument("--candidate")
+    h.add_argument("--min-pf", type=float, default=1.2, help="profit factor needed (1.0 = break-even)")
+    h.add_argument("--min-trades", type=int, default=20, help="fewest trades per period to trust the result")
+    h.add_argument("--min-return", type=float, default=0.0, help="return needed in each period (0.0 = above zero)")
+    h.set_defaults(fn=cmd_hypothesis)
     e = sub.add_parser("experiments"); e.add_argument("--limit", type=int, default=15); e.set_defaults(fn=cmd_experiments)
     r = sub.add_parser("run")
     r.add_argument("--minutes", type=float, default=None, help="stop after N minutes (default: run until Ctrl+C)")
@@ -200,6 +289,8 @@ def main(argv=None):
     rf.add_argument("--reason", required=True, help="why the paper settings are being changed")
     rf.set_defaults(fn=cmd_refreeze)
     sub.add_parser("status").set_defaults(fn=cmd_status)
+    sub.add_parser("ops").set_defaults(fn=cmd_ops)
+    d = sub.add_parser("diagnose"); d.add_argument("--version", default=None); d.set_defaults(fn=cmd_diagnose)
     sub.add_parser("kill").set_defaults(fn=cmd_kill)
     sub.add_parser("resume").set_defaults(fn=cmd_resume)
     sub.add_parser("dashboard").set_defaults(fn=cmd_dashboard)
