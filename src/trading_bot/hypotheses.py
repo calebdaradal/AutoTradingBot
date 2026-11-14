@@ -5,6 +5,8 @@ Pass marks (thresholds) are fixed when the hypothesis is created and cannot be e
 
 States:  DRAFT -> (backtest on train + validation) -> QUALIFIED_CANDIDATE or REJECTED
          QUALIFIED_CANDIDATE -> (final test, once) -> stays QUALIFIED_CANDIDATE if it passes, else REJECTED
+REJECTED means "tested properly, the idea failed". It is different from a TECHNICALLY INVALID test (bug, bad data,
+crashed run): see invalidate_batch(), which withdraws the verdict and lets the idea be re-tested after the fix.
 Only ONE hypothesis may be open (DRAFT or QUALIFIED_CANDIDATE awaiting its final test) at a time.
 Stored in the database 'state' table under the key 'hypotheses'.
 """
@@ -93,8 +95,9 @@ def judge(thresholds: dict, metrics: dict) -> list:
     return fails
 
 
-def record_dev_results(db, hid, results: dict) -> dict:
-    """results = {'train': metrics, 'validation': metrics}. Moves DRAFT to QUALIFIED_CANDIDATE or REJECTED."""
+def record_dev_results(db, hid, results: dict, batch=None) -> dict:
+    """results = {'train': metrics, 'validation': metrics}. Moves DRAFT to QUALIFIED_CANDIDATE or REJECTED.
+    batch = the experiment batch these numbers came from (so a broken test can be invalidated later)."""
     items = _all(db)
     h = next((x for x in items if x["id"] == hid), None)
     if h is None:
@@ -105,6 +108,7 @@ def record_dev_results(db, hid, results: dict) -> dict:
     fails = {p: judge(h["thresholds"], m) for p, m in results.items()}
     h["results"] = {p: {k: m[k] for k in ("trades", "net_return", "profit_factor", "max_drawdown", "buy_hold_return")}
                     for p, m in results.items()}
+    h["dev_batch"] = batch
     bad = [f"{p}: {f}" for p, fs in fails.items() for f in fs]
     if bad:
         _log(h, "REJECTED", "failed pass marks: " + "; ".join(bad), h["results"])
@@ -142,6 +146,41 @@ def close_hypothesis(db, hid, reason) -> dict:
     _log(h, "RETIRED", reason)
     _save(db, items)
     return h
+
+
+def invalidate_batch(db, batch, category, reason) -> dict:
+    """The TEST was broken (bug, bad data, crashed run), not the idea. Flag every experiment in the batch as invalid.
+    If a hypothesis was judged on that batch, withdraw its verdict and reopen it (DRAFT) so it can be re-tested
+    after the problem is fixed. Its pass marks stay exactly as written. Refused once a final test was taken."""
+    import re
+    from .research import InvalidExperimentError, invalidate_experiments
+    rows = db.conn.execute("SELECT id, note FROM experiments WHERE batch=?", (batch,)).fetchall()
+    if not rows:
+        raise InvalidExperimentError(f"No experiments in batch {batch} (see 'experiments' for batch numbers)")
+    hids = {m.group(1) for r in rows for m in [re.search(r"hypothesis=(H\d+)", r["note"] or "")] if m}
+    items = _all(db)
+    touched = [h for h in items if h["id"] in hids]
+    for h in touched:
+        if h.get("final"):
+            raise HypothesisError(f"{h['id']} already took its final test, so its history is locked. "
+                                  f"Write a new hypothesis with a new version id instead.")
+        other = open_hypothesis(db)
+        if h.get("dev_batch") == batch and h["state"] in ("REJECTED", "QUALIFIED_CANDIDATE") \
+                and other and other["id"] != h["id"]:
+            raise HypothesisError(f"{other['id']} is open. Finish or close it before reopening {h['id']}.")
+    ids = invalidate_experiments(db, [r["id"] for r in rows], category, reason)     # may refuse (final tests etc.)
+    reopened = []
+    for h in touched:
+        prior = {"state": h["state"], "results": h["results"]}
+        h.setdefault("invalidations", []).append({"ts_ms": now_ms(), "batch": batch, "experiment_ids": ids,
+                                                  "category": category, "reason": reason, "withdrawn": prior})
+        if h.get("dev_batch") == batch and h["state"] in ("REJECTED", "QUALIFIED_CANDIDATE"):
+            h["results"], h["dev_batch"] = {}, None
+            _log(h, "DRAFT", f"TEST INVALID ({category}): {reason}. The {prior['state']} verdict is withdrawn "
+                             f"(not evidence about the idea). Re-test after the fix.", prior)
+            reopened.append(h["id"])
+    _save(db, items)
+    return {"experiment_ids": ids, "reopened": reopened}
 
 
 def require_final_ready(db, candidate) -> dict:

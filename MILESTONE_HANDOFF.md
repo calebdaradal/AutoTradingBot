@@ -116,7 +116,13 @@ The two tracks are kept apart on purpose. The paper run always uses frozen v1.0.
 - `backtest --candidate X` tests train + validation (and cost stress), saves every run, and marks the hypothesis QUALIFIED_CANDIDATE or REJECTED. A rejected idea cannot be re-judged; write a new one with a new version.
 - `final-check --candidate X --confirm` works only for a QUALIFIED_CANDIDATE and only once per candidate.
 - Promotion to paper needs a deliberate `refreeze` and starts a new 30-day clock.
-- Tests: 85 passing.
+- **REJECTED vs INVALID** (two different things):
+  - REJECTED = the test was sound and the idea failed. Final, counts as evidence.
+  - INVALID = the TEST was broken (`bug`, `bad_data`, `failed_run`). Not evidence about the idea. Flagged, never deleted. Skipped by `diagnose`. Shown as `[INVALID TEST]` in `experiments`.
+  - Automatic: `backtest` checks candles first (gaps, duplicates, impossible prices) and refuses to run on bad data. If a run crashes midway, its partial results are flagged `failed_run` and no verdict is recorded.
+  - Manual: `invalidate --batch N --category ... --reason ...` for bugs found later. It withdraws the verdict and reopens the idea as DRAFT with the same pass marks, so it can be re-tested after the fix. The old verdict stays in the idea's history.
+  - Limits: "the result was bad" is not a valid reason. Final tests can never be flagged, and an idea that took its final test is locked (write a new version instead). Needs no other idea open.
+- Tests: 95 passing.
 
 ### Workflow
 `diagnose` -> register candidate class -> `hypothesis add` -> `backtest --candidate X` -> (if qualified) `final-check --candidate X --confirm`.
@@ -140,6 +146,7 @@ Run from the project folder using `.venv\Scripts\python.exe -m trading_bot <comm
 | `hypothesis add/list/close` | Track B: one idea at a time with fixed pass marks |
 | `backtest --candidate X` | Test a candidate on train + validation |
 | `final-check --candidate X` | Final test for a qualified candidate (once) |
+| `invalidate --batch N` | Flag a broken test (bug / bad data / failed run) and reopen the idea |
 | `experiments` | List saved backtest receipts (settings, data fingerprint, code version, results) |
 | `refreeze --reason "why"` | Accept changed settings for paper trading (treat as a new experiment) |
 | `run` | Start paper trading (live prices, fake money) |

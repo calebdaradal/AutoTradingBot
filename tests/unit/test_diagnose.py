@@ -189,3 +189,121 @@ def test_final_test_is_per_strategy_version(db, cfg):
     with pytest.raises(FinalTestError):
         check_final_test(db, cfg, res.start_ms, res.end_ms, "a-1.0")
     assert check_final_test(db, cfg, res.start_ms, res.end_ms, "b-1.0")["prior_looks"] == 1   # different idea: allowed
+
+
+# ------------------------------------------------------------------ invalid tests vs rejected ideas
+from trading_bot.models import Candle
+from trading_bot.research import (InvalidExperimentError, invalid_experiments, invalidate_experiments,
+                                  validate_candles)
+
+STEP = 900_000
+
+
+def _bars(starts, **kw):
+    return [Candle(s, kw.get("o", 100), kw.get("h", 101), kw.get("l", 99), kw.get("c", 100), kw.get("v", 1)) for s in starts]
+
+
+def test_validate_candles_accepts_clean_data_and_names_each_fault():
+    assert validate_candles(_bars([0, STEP, 2 * STEP]), STEP) == []
+    assert "no candles" in validate_candles([], STEP)[0]
+    assert "gap" in validate_candles(_bars([0, STEP, 3 * STEP]), STEP)[0]
+    assert "duplicate" in validate_candles(_bars([0, STEP, STEP]), STEP)[0]
+    assert "impossible" in validate_candles(_bars([0], o=0), STEP)[0]
+    assert "impossible" in validate_candles(_bars([0], h=90), STEP)[0]          # high below low
+
+
+def _exp(db, cfg, batch, kind="backtest", label="train", note=""):
+    res, entry = _result(cfg)
+    return record_experiment(db, kind=kind, label=label, cfg=cfg, strategy_version=BASELINE_VERSION,
+                             dataset=dataset_info(entry), result=res, batch=batch, note=note)
+
+
+def test_invalidating_needs_a_technical_reason(db, cfg):
+    i = _exp(db, cfg, 1)
+    with pytest.raises(InvalidExperimentError, match="not a reason"):
+        invalidate_experiments(db, [i], "result_was_bad", "x")
+    with pytest.raises(InvalidExperimentError, match="technically wrong"):
+        invalidate_experiments(db, [i], "bug", "  ")
+    with pytest.raises(InvalidExperimentError, match="No experiment"):
+        invalidate_experiments(db, [999], "bug", "x")
+    assert invalid_experiments(db) == {}
+
+
+def test_flagging_never_deletes_and_cannot_be_done_twice(db, cfg):
+    i = _exp(db, cfg, 1)
+    invalidate_experiments(db, [i], "bug", "fee was applied twice")
+    assert invalid_experiments(db)[i]["category"] == "bug"
+    assert db.conn.execute("SELECT COUNT(*) FROM experiments").fetchone()[0] == 1      # still on record
+    with pytest.raises(InvalidExperimentError, match="already flagged"):
+        invalidate_experiments(db, [i], "bug", "again")
+
+
+def test_final_tests_can_never_be_flagged_invalid(db, cfg):
+    i = _exp(db, cfg, 1, kind="final_test", label="final")
+    with pytest.raises(InvalidExperimentError, match="Final tests cannot"):
+        invalidate_experiments(db, [i], "bug", "pretend it was broken")
+    assert invalid_experiments(db) == {}
+
+
+def test_diagnosis_ignores_flagged_experiments(db, cfg):
+    good = _exp(db, cfg, 1)
+    broken = _exp(db, cfg, 2)
+    invalidate_experiments(db, [broken], "bad_data", "gaps in the candles")
+    row = db.conn.execute("SELECT trades_json FROM experiments WHERE id=?", (good,)).fetchone()
+    assert load_trades(db, BASELINE_VERSION)["train"] == json.loads(row["trades_json"])
+    invalidate_experiments(db, [good], "bug", "also broken")
+    assert load_trades(db, BASELINE_VERSION) == {"train": [], "validation": []}      # nothing valid left
+
+
+def _judged_batch(db, cfg, sandbox, verdict_bad=True, batch=5):
+    """H1 judged REJECTED (or QUALIFIED) from experiments saved in `batch`."""
+    _add(db, sandbox)
+    ids = [_exp(db, cfg, batch, label=l, note="hypothesis=H1") for l in ("train", "validation")]
+    bad = dict(GOOD, net_return=-0.02, profit_factor=0.6)
+    hy.record_dev_results(db, "H1", {"train": GOOD, "validation": bad if verdict_bad else GOOD}, batch)
+    return ids
+
+
+def test_invalid_test_withdraws_the_rejection_and_reopens_the_idea(db, cfg, sandbox):
+    _judged_batch(db, cfg, sandbox)
+    before = hy.get_hypothesis(db, "H1")
+    assert before["state"] == "REJECTED"
+    out = hy.invalidate_batch(db, 5, "bug", "stop price was read from the wrong candle")
+    h = hy.get_hypothesis(db, "H1")
+    assert out["reopened"] == ["H1"] and len(out["experiment_ids"]) == 2
+    assert h["state"] == "DRAFT" and h["results"] == {} and h["dev_batch"] is None
+    assert h["thresholds"] == before["thresholds"]                                  # pass marks unchanged
+    assert h["invalidations"][0]["withdrawn"]["state"] == "REJECTED"                # old verdict kept as history
+    assert "not evidence" in h["history"][-1]["reason"]
+    assert hy.open_hypothesis(db)["id"] == "H1"
+    # after the fix it can be judged again
+    assert hy.record_dev_results(db, "H1", {"train": GOOD, "validation": GOOD}, 6)["state"] == "QUALIFIED_CANDIDATE"
+
+
+def test_a_real_rejection_stays_rejected_without_an_invalid_flag(db, cfg, sandbox):
+    _judged_batch(db, cfg, sandbox)
+    assert hy.get_hypothesis(db, "H1")["state"] == "REJECTED"
+    assert invalid_experiments(db) == {}
+    with pytest.raises(hy.HypothesisError, match="already judged"):
+        hy.record_dev_results(db, "H1", {"train": GOOD, "validation": GOOD})
+
+
+def test_invalidating_is_refused_after_the_final_test(db, cfg, sandbox):
+    _judged_batch(db, cfg, sandbox, verdict_bad=False)
+    hy.record_final_result(db, "H1", GOOD, 99)
+    with pytest.raises(hy.HypothesisError, match="history is locked"):
+        hy.invalidate_batch(db, 5, "bug", "found a bug later")
+    assert invalid_experiments(db) == {}
+
+
+def test_cannot_reopen_a_rejected_idea_while_another_is_open(db, cfg, sandbox):
+    _judged_batch(db, cfg, sandbox)
+    _add(db, sandbox)                                                              # H2 is now the open one
+    with pytest.raises(hy.HypothesisError, match="H2 is open"):
+        hy.invalidate_batch(db, 5, "bug", "x")
+    assert hy.get_hypothesis(db, "H1")["state"] == "REJECTED" and invalid_experiments(db) == {}
+
+
+def test_invalidating_an_unknown_batch_is_a_clean_error(db):
+    with pytest.raises(InvalidExperimentError, match="No experiments in batch"):
+        hy.invalidate_batch(db, 12345, "bug", "x")

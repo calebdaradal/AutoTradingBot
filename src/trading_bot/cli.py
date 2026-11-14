@@ -7,6 +7,7 @@
   hypothesis   add / list / close ideas. One at a time, written down before testing
   final-check  take the locked final test (needs --candidate and --confirm; only for a qualified candidate)
   experiments  list the saved receipts of past backtests
+  invalidate   flag a broken TEST (bug, bad data, crashed run) so it is not counted as evidence; reopens the idea
   run          start paper trading (fake money, real prices). Settings are frozen on first start
   refreeze     accept changed settings for the paper run (needs --reason)
   status       show how the paper run is doing
@@ -72,35 +73,54 @@ def cmd_backtest(cfg, a):
     start, version = starting_balance_usdt(cfg), (strat or TrendMomentum(cfg.strategy)).version
     ranges = split_ranges(len(entry), cfg)
     dev_hi = ranges["validation"][1]           # everything BEFORE the locked final test
+    from .models import interval_ms
+    from .research import invalidate_experiments, validate_candles
+    problems = (validate_candles(entry[:dev_hi], interval_ms(cfg.data.entry_interval))
+                + validate_candles(trend, interval_ms(cfg.data.trend_interval)))
+    if problems:                                # broken data = broken test. Nothing is run or judged.
+        for p in problems:
+            log.error(f"Data problem: {p}")
+        log.error("Backtest NOT run: this is a data fault, not a strategy result. "
+                  "Run 'sync' to repair, then try again. The hypothesis stays untested.")
+        return
     batch = now_ms()
     ds = dataset_info(entry[:dev_hi])
     log.ok(f"Backtest on {dev_hi} candles ({dev_hi / 96:.0f} days) before the locked final test, start {start:.2f} USDT")
     log.note(f"Final test period ({len(entry) - dev_hi} candles, the newest data) is LOCKED. Use 'final-check' once at the very end.")
+    saved = []
 
     def save(kind, label, r, trades=True):
-        record_experiment(db, kind=kind, label=label, cfg=cfg, strategy_version=version, dataset=ds,
-                          result=r, batch=batch, include_trades=trades,
-                          note=f"hypothesis={hyp['id']}" if hyp else "")
+        saved.append(record_experiment(db, kind=kind, label=label, cfg=cfg, strategy_version=version, dataset=ds,
+                                       result=r, batch=batch, include_trades=trades,
+                                       note=f"hypothesis={hyp['id']}" if hyp else ""))
 
     dev = {}
-    for name in ("train", "validation"):
-        lo, hi = ranges[name]
-        r = run_backtest(entry, trend, cfg, start, lo, hi, name, feats, strat=strat)
-        dev[name] = r.metrics()
-        save("backtest", name, r)
-        for line in r.summary_lines():
-            log.note(line)
-    log.note("--- Stress test: what if trading costs are higher? (train + validation) ---")
-    for mult in (1.0, 2.0, 3.0):
-        r = run_backtest(entry, trend, with_overrides(cfg, cost_mult=mult), start, 0, dev_hi, f"costs x{mult:g}", feats,
-                         strat=strat)
-        save("stress", f"costs x{mult:g}", r, trades=False)
-        log.note(f"costs x{mult:g}: result {r.net_return:+.2%}, {len(r.trades)} trades, max drop {r.max_drawdown:.2%}")
-        if mult == 1.0 and r.blocked:
-            log.note("  Most common blocks: " + ", ".join(f"{k} ({v})" for k, v in
-                                                          sorted(r.blocked.items(), key=lambda x: -x[1])[:3]))
+    try:
+        for name in ("train", "validation"):
+            lo, hi = ranges[name]
+            r = run_backtest(entry, trend, cfg, start, lo, hi, name, feats, strat=strat)
+            dev[name] = r.metrics()
+            save("backtest", name, r)
+            for line in r.summary_lines():
+                log.note(line)
+        log.note("--- Stress test: what if trading costs are higher? (train + validation) ---")
+        for mult in (1.0, 2.0, 3.0):
+            r = run_backtest(entry, trend, with_overrides(cfg, cost_mult=mult), start, 0, dev_hi, f"costs x{mult:g}",
+                             feats, strat=strat)
+            save("stress", f"costs x{mult:g}", r, trades=False)
+            log.note(f"costs x{mult:g}: result {r.net_return:+.2%}, {len(r.trades)} trades, max drop {r.max_drawdown:.2%}")
+            if mult == 1.0 and r.blocked:
+                log.note("  Most common blocks: " + ", ".join(f"{k} ({v})" for k, v in
+                                                              sorted(r.blocked.items(), key=lambda x: -x[1])[:3]))
+    except Exception as e:                      # a crashed run is a technical failure, never a strategy verdict
+        log.error(f"Backtest crashed: {type(e).__name__}: {e}")
+        if saved:
+            invalidate_experiments(db, saved, "failed_run", f"run crashed: {type(e).__name__}: {e}")
+            log.warn(f"{len(saved)} partial result(s) flagged INVALID (failed run). Fix the problem and run again.")
+        log.warn("No verdict was recorded. This says nothing about whether the idea works.")
+        return
     if hyp:
-        done = hy.record_dev_results(db, hyp["id"], dev)
+        done = hy.record_dev_results(db, hyp["id"], dev, batch)
         why = done["history"][-1]["reason"]
         (log.ok if done["state"] == "QUALIFIED_CANDIDATE" else log.warn)(f"{hyp['id']} is now {done['state']}: {why}")
         log.note("Candidates are not sensitivity-tested here; that is a later robustness step.")
@@ -192,6 +212,8 @@ def cmd_hypothesis(cfg, a):
             log.note(f"   idea: {h['statement']}")
             log.note(f"   expected: {h['prediction']}")
             log.note(f"   last step: {h['history'][-1]['reason']}")
+            if h.get("invalidations"):
+                log.note(f"   broken tests so far: {len(h['invalidations'])} (flagged invalid, not counted as failures)")
         log.ok(f"{len(items)} hypothesis(es) on file" if items else "No hypotheses yet. Add one with 'hypothesis add'")
 
 
@@ -202,13 +224,24 @@ def cmd_experiments(cfg, a):
     if not rows:
         log.note("No experiments saved yet. Run 'backtest' first.")
         return
+    from .research import invalid_experiments
+    bad = invalid_experiments(Database(cfg.data.db_path))
     for r in rows:
         m = json.loads(r["metrics_json"])
         when = __import__("datetime").datetime.fromtimestamp(r["ts_ms"] / 1000).strftime("%Y-%m-%d %H:%M")
         dirty = "+uncommitted" if r["git_dirty"] else ""
-        log.note(f"#{r['id']} {when} {r['kind']}/{r['label']}: {m['net_return']:+.2%}, {m['trades']} trades, "
-                 f"expectancy {m['expectancy']:+.4f} | {r['strategy_version']} cfg {r['config_hash'][:8]} "
-                 f"code {r['git_commit']}{dirty}")
+        flag = f" [INVALID TEST: {bad[r['id']]['category']}, not evidence]" if r["id"] in bad else ""
+        log.note(f"#{r['id']} (batch {r['batch']}) {when} {r['kind']}/{r['label']}: {m['net_return']:+.2%}, "
+                 f"{m['trades']} trades, expectancy {m['expectancy']:+.4f} | {r['strategy_version']} "
+                 f"cfg {r['config_hash'][:8]} code {r['git_commit']}{dirty}{flag}")
+
+
+def cmd_invalidate(cfg, a):
+    from . import hypotheses as hy
+    out = hy.invalidate_batch(Database(cfg.data.db_path), a.batch, a.category, a.reason)
+    log.ok(f"{len(out['experiment_ids'])} experiment(s) flagged INVALID ({a.category}): they are not evidence about the strategy")
+    for hid in out["reopened"]:
+        log.ok(f"{hid} verdict withdrawn and reopened (DRAFT). Fix the problem, then re-run 'backtest --candidate ...'")
 
 
 def cmd_run(cfg, a):
@@ -281,6 +314,12 @@ def main(argv=None):
     h.add_argument("--min-return", type=float, default=0.0, help="return needed in each period (0.0 = above zero)")
     h.set_defaults(fn=cmd_hypothesis)
     e = sub.add_parser("experiments"); e.add_argument("--limit", type=int, default=15); e.set_defaults(fn=cmd_experiments)
+    iv = sub.add_parser("invalidate")
+    iv.add_argument("--batch", type=int, required=True, help="batch number shown by 'experiments'")
+    iv.add_argument("--category", required=True, choices=["bug", "bad_data", "failed_run"],
+                    help="what was technically wrong with the TEST (a bad result is not a reason)")
+    iv.add_argument("--reason", required=True, help="what was wrong and what was fixed")
+    iv.set_defaults(fn=cmd_invalidate)
     r = sub.add_parser("run")
     r.add_argument("--minutes", type=float, default=None, help="stop after N minutes (default: run until Ctrl+C)")
     r.add_argument("--heartbeat", type=int, default=60, help="seconds between status lines")

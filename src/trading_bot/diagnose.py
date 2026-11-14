@@ -10,11 +10,14 @@ from .candidates import BASELINE_VERSION  # noqa: F401  (re-exported for the CLI
 
 def load_trades(db, version: str, labels=("train", "validation")) -> dict:
     """Trades from the most recent saved backtest of each period. {label: [trade, ...]}"""
+    from .research import invalid_experiments
+    bad = invalid_experiments(db)                    # broken tests are not evidence: skip them
     out = {}
     for lab in labels:
-        row = db.conn.execute(
-            "SELECT trades_json FROM experiments WHERE kind='backtest' AND label=? AND strategy_version=? "
-            "AND trades_json IS NOT NULL ORDER BY id DESC LIMIT 1", (lab, version)).fetchone()
+        rows = db.conn.execute(
+            "SELECT id, trades_json FROM experiments WHERE kind='backtest' AND label=? AND strategy_version=? "
+            "AND trades_json IS NOT NULL ORDER BY id DESC", (lab, version)).fetchall()
+        row = next((r for r in rows if r["id"] not in bad), None)
         out[lab] = json.loads(row["trades_json"]) if row else []
     return out
 

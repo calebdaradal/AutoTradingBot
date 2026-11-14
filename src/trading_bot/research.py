@@ -85,8 +85,74 @@ def record_experiment(db, *, kind, label, cfg, strategy_version, dataset, result
 
 def recent_experiments(db, limit=15):
     return db.conn.execute(
-        "SELECT id,ts_ms,kind,label,strategy_version,config_hash,git_commit,git_dirty,metrics_json "
+        "SELECT id,batch,ts_ms,kind,label,strategy_version,config_hash,git_commit,git_dirty,metrics_json "
         "FROM experiments ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+
+
+# ------------------------------------------------------------------ invalid experiments
+# A REJECTED idea means "the strategy was tested properly and did not work".
+# An INVALID experiment means "the test itself was broken" (a bug, bad data, or a crashed run).
+# Invalid results are not evidence about the strategy. They are flagged (never deleted: receipts are permanent),
+# ignored by diagnose, and the idea may be re-tested after the problem is fixed.
+INVALID_CATEGORIES = ("bug", "bad_data", "failed_run")
+
+
+class InvalidExperimentError(Exception):
+    pass
+
+
+def invalid_experiments(db) -> dict:
+    """{experiment_id: {'ts_ms','category','reason'}} for every experiment flagged invalid."""
+    return {int(k): v for k, v in db.get_state("invalid_experiments", {}).items()}
+
+
+def validate_candles(candles, step_ms) -> list:
+    """Cheap data check before a backtest. Returns a list of problems (empty = data looks sound)."""
+    gaps = dups = bad = 0
+    for i, c in enumerate(candles):
+        if min(c.open, c.high, c.low, c.close) <= 0 or c.high < c.low or c.volume < 0:
+            bad += 1
+        if i:
+            d = c.start - candles[i - 1].start
+            dups += d <= 0
+            gaps += d > step_ms
+    out = []
+    if not candles:
+        out.append("no candles at all")
+    if gaps:
+        out.append(f"{gaps} gap(s) in the price history")
+    if dups:
+        out.append(f"{dups} duplicate or out-of-order candle(s)")
+    if bad:
+        out.append(f"{bad} candle(s) with impossible prices")
+    return out
+
+
+def invalidate_experiments(db, ids, category, reason) -> list:
+    """Flag experiments as technically invalid. Final tests can never be flagged (that would hand out a second look)."""
+    if category not in INVALID_CATEGORIES:
+        raise InvalidExperimentError(f"category must be one of {', '.join(INVALID_CATEGORIES)}. "
+                                     f"'The result was bad' is not a reason: that is what REJECTED is for.")
+    if not (reason or "").strip():
+        raise InvalidExperimentError("Say what was technically wrong (and what was fixed)")
+    ids = list(ids)
+    if not ids:
+        raise InvalidExperimentError("No experiments to flag")
+    marks = db.get_state("invalid_experiments", {})
+    for i in ids:
+        row = db.conn.execute("SELECT kind FROM experiments WHERE id=?", (i,)).fetchone()
+        if row is None:
+            raise InvalidExperimentError(f"No experiment #{i}")
+        if row["kind"] == "final_test":
+            raise InvalidExperimentError(f"#{i} is a final test. Final tests cannot be flagged invalid: "
+                                         f"a second look would not be honest.")
+        if str(i) in marks:
+            raise InvalidExperimentError(f"#{i} is already flagged invalid")
+    ts = now_ms()
+    for i in ids:
+        marks[str(i)] = {"ts_ms": ts, "category": category, "reason": reason}
+    db.set_state("invalid_experiments", marks)
+    return ids
 
 
 # ------------------------------------------------------------------ protected final test
