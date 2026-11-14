@@ -1,6 +1,6 @@
 """SQLite storage. One file holds candles, decisions, orders, fills, equity and events.
 
-Decisions, orders, fills, equity and events are IMMUTABLE: the database itself refuses
+Decisions, orders, fills, equity, events and experiments are IMMUTABLE: the database itself refuses
 to change or delete them (triggers below), so the history can always be trusted.
 """
 import json
@@ -43,9 +43,16 @@ CREATE TABLE IF NOT EXISTS runs(
   strategy_version TEXT NOT NULL, config_json TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS state(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS experiments(
+  id INTEGER PRIMARY KEY AUTOINCREMENT, ts_ms INTEGER NOT NULL, batch INTEGER NOT NULL,
+  kind TEXT NOT NULL, label TEXT NOT NULL, strategy_version TEXT NOT NULL,
+  config_hash TEXT NOT NULL, config_json TEXT NOT NULL, git_commit TEXT, git_dirty INTEGER,
+  data_start_ms INTEGER, data_end_ms INTEGER, candles INTEGER, dataset_hash TEXT,
+  metrics_json TEXT NOT NULL, trades_json TEXT, note TEXT
+);
 """
 
-IMMUTABLE = ("decisions", "orders", "fills", "equity", "events")
+IMMUTABLE = ("decisions", "orders", "fills", "equity", "events", "experiments")
 
 
 class Database:

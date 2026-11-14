@@ -107,6 +107,8 @@ In this order, smallest first:
 
 Skip for now (too heavy for a solo project): full Gates A-G, Monte Carlo, full lifecycle state machine.
 
+**Status update:** recommendations 1-7 are now done (see `MILESTONE_HANDOFF.md`, "Research hardening"). Next is item 8.
+
 ## 9. Open questions
 
 - Do you want to keep running the current v1.0 paper test, or pause until the fixes above?

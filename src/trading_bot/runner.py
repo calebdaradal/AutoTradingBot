@@ -18,6 +18,7 @@ from .execution import PaperBroker, load_portfolio, reconcile
 from .features import build_features
 from .models import interval_ms, now_ms
 from .portfolio import Portfolio
+from .research import check_config_freeze, config_hash
 from .risk import RiskManager, utc_day
 from .strategies import BUY, SELL, Context, Position, TrendMomentum
 
@@ -45,6 +46,9 @@ class Runner:
     # ------------------------------------------------------------------ startup
     def start(self):
         cfg, db = self.cfg, self.db
+        state = check_config_freeze(db, cfg)   # refuses to start if settings changed since first start
+        log.ok(f"Settings frozen (id {config_hash(cfg)})" if state == "frozen"
+               else f"Settings match the frozen paper config (id {config_hash(cfg)})")
         db.conn.execute("INSERT INTO runs(started_ms,profile,strategy_version,config_json) VALUES(?,?,?,?)",
                         (now_ms(), cfg.profile, self.strat.version, str(cfg.raw)))
         log.ok(f"Starting paper trading: {self.sym}, profile '{cfg.profile}', strategy {self.strat.version}")

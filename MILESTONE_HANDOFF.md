@@ -88,7 +88,16 @@ Legend: **FINISHED** = built and tested. **NEXT** = work to do now. **NOT DONE**
 | Dashboard shows net P&L and drawdown | Done (`dashboard`) |
 | Out-of-sample + benchmark evaluation | Done - **result negative** |
 | 30+ days of paper results, no rule changes | **NOT DONE - needs calendar time** |
-| All critical tests pass | Done (30 passing) |
+| All critical tests pass | Done (58 passing) |
+
+## Research hardening (done after the gap report)
+- Backtester tests: `tests/unit/test_backtest.py` (14). Research tests: `tests/unit/test_research.py` (14). Total 58 passing.
+- New metrics: expectancy, avg win/loss, biggest win/loss, losing streak, drawdown duration, turnover, MFE/MAE.
+- `experiments` table (immutable) + `research.py`: every backtest is saved with settings, dataset checksum, git commit.
+- Final test protected: `backtest` no longer touches it; `final-check --confirm` records one look per settings + dates.
+- Paper config freeze: `run` freezes settings on first start and refuses to start if they change.
+- History expanded to 730 days (70,080 x 15m candles, 0 gaps). Backtest now uses the first 75% (548 days).
+- **v1.0 on 2 years of data (train/validation only):** train -14.78% (buy-and-hold +4.24%), validation -13.81% (buy-and-hold -16.76%). Profit factor 0.41 / 0.18. Still FAILED. Final test not taken yet.
 
 ## Next to implement
 1. **Start the paper run now** and leave it running (see commands). Do not change rules during the 30 days.
@@ -102,7 +111,10 @@ Run from the project folder using `.venv\Scripts\python.exe -m trading_bot <comm
 | Command | What it does |
 |---------|--------------|
 | `sync` | Download/refresh candle history |
-| `backtest` | Test the strategy on past data |
+| `backtest` | Test on past data (train + validation only; final test stays locked). Every run is saved |
+| `final-check` | Show whether the final test can be taken; add `--confirm` to take it. Allowed once per settings + dates |
+| `experiments` | List saved backtest receipts (settings, data fingerprint, code version, results) |
+| `refreeze --reason "why"` | Accept changed settings for paper trading (treat as a new experiment) |
 | `run` | Start paper trading (live prices, fake money) |
 | `status` | Print account, open position, verdict |
 | `kill` | Emergency stop: no new buys, closes any open position |

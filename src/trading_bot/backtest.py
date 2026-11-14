@@ -67,6 +67,79 @@ class Result:
     def exposure(self):
         return self.bars_in_market / self.bars if self.bars else 0.0
 
+    # ---- extra honesty numbers (plain meaning in the comments) ----
+    @property
+    def avg_win(self):          # average profit of a winning trade (USDT)
+        w = [t["net"] for t in self.trades if t["net"] > 0]
+        return sum(w) / len(w) if w else 0.0
+
+    @property
+    def avg_loss(self):         # average loss of a losing trade (USDT, negative number)
+        l = [t["net"] for t in self.trades if t["net"] < 0]
+        return sum(l) / len(l) if l else 0.0
+
+    @property
+    def expectancy(self):       # average result per trade after costs (USDT). Must be > 0 to have an edge
+        return self.net_pnl / len(self.trades) if self.trades else 0.0
+
+    @property
+    def largest_win(self):
+        return max((t["net"] for t in self.trades), default=0.0)
+
+    @property
+    def largest_loss(self):
+        return min((t["net"] for t in self.trades), default=0.0)
+
+    @property
+    def longest_losing_streak(self):   # most losing trades in a row
+        best = cur = 0
+        for t in self.trades:
+            cur = cur + 1 if t["net"] < 0 else 0
+            best = max(best, cur)
+        return best
+
+    @property
+    def longest_drawdown_days(self):   # longest time spent below a previous peak
+        peak, peak_ts, worst = self.start_equity, self.start_ms, 0
+        for ts, e in self.equity_curve:
+            if e >= peak:
+                peak, peak_ts = e, ts
+            else:
+                worst = max(worst, ts - peak_ts)
+        return worst / 86_400_000
+
+    @property
+    def turnover(self):         # total money bought + sold, as a multiple of the starting balance
+        v = sum(t["qty"] * (t["entry"] + t["exit"]) for t in self.trades)
+        return v / self.start_equity if self.start_equity else 0.0
+
+    @property
+    def avg_mfe(self):          # on average, how far a trade went IN our favour before it ended
+        m = [t["mfe"] for t in self.trades if "mfe" in t]
+        return sum(m) / len(m) if m else 0.0
+
+    @property
+    def avg_mae(self):          # on average, how far a trade went AGAINST us before it ended (negative)
+        m = [t["mae"] for t in self.trades if "mae" in t]
+        return sum(m) / len(m) if m else 0.0
+
+    def metrics(self) -> dict:
+        """All headline numbers as plain numbers (safe to save as JSON; 'infinite' becomes None)."""
+        pf = self.profit_factor
+        return {
+            "days": round((self.end_ms - self.start_ms) / 86_400_000, 2), "trades": len(self.trades),
+            "start_equity": self.start_equity, "end_equity": self.end_equity,
+            "net_return": self.net_return, "buy_hold_return": self.buy_hold_return,
+            "gross_pnl": self.gross_pnl, "net_pnl": self.net_pnl, "fees_paid": self.fees_paid,
+            "max_drawdown": self.max_drawdown, "longest_drawdown_days": self.longest_drawdown_days,
+            "win_rate": self.win_rate, "profit_factor": None if pf == float("inf") else pf,
+            "expectancy": self.expectancy, "avg_win": self.avg_win, "avg_loss": self.avg_loss,
+            "largest_win": self.largest_win, "largest_loss": self.largest_loss,
+            "longest_losing_streak": self.longest_losing_streak, "turnover": self.turnover,
+            "exposure": self.exposure, "avg_mfe": self.avg_mfe, "avg_mae": self.avg_mae,
+            "blocked": dict(self.blocked),
+        }
+
     def summary_lines(self):
         days = max((self.end_ms - self.start_ms) / 86_400_000, 1e-9)
         return [
@@ -74,6 +147,9 @@ class Result:
             f"  Bot result (after costs): {self.net_return:+.2%}   | Buy-and-hold: {self.buy_hold_return:+.2%}   | Do-nothing: +0.00%",
             f"  Profit before costs: {self.gross_pnl:+.3f} USDT | after costs: {self.net_pnl:+.3f} USDT | fees paid: {self.fees_paid:.3f} USDT",
             f"  Worst drop from a peak: {self.max_drawdown:.2%} | win rate: {self.win_rate:.0%} | profit factor: {self.profit_factor:.2f} | time in market: {self.exposure:.0%}",
+            f"  Avg per trade: {self.expectancy:+.4f} USDT | avg win {self.avg_win:+.4f} | avg loss {self.avg_loss:+.4f} | "
+            f"biggest loss {self.largest_loss:+.4f} | losing streak {self.longest_losing_streak} | "
+            f"longest time under a peak: {self.longest_drawdown_days:.0f} days | turnover {self.turnover:.1f}x",
         ]
 
 
@@ -118,6 +194,9 @@ def run_backtest(entry, trend, cfg, start_equity: float, lo: int = 0, hi: int | 
             "entry_ms": entry_info["ts"], "exit_ms": bar_ts, "entry": entry_info["price"], "exit": fill.price,
             "qty": fill.qty, "gross": fill.realized_gross, "net": fill.realized_net, "reason": reason,
             "bars": pos.bars_held,
+            "mfe": entry_info["hi"] / entry_info["price"] - 1,   # best the price got vs our entry
+            "mae": entry_info["lo"] / entry_info["price"] - 1,   # worst the price got vs our entry
+            "signal": entry_info.get("signal"),                  # what the indicators said at the decision
         })
         risk.record_trade_result(fill.realized_net, bar_ts)
         pos, bars_since_exit = None, 0
@@ -140,7 +219,8 @@ def run_backtest(entry, trend, cfg, start_equity: float, lo: int = 0, hi: int | 
                     fill = pf.buy(qty, price)
                     res.fees_paid += fill.fee
                     pos = strat.make_position(fill.price, fill.qty, info["atr"], bar.start)
-                    entry_info = {"ts": bar.start, "price": fill.price}
+                    entry_info = {"ts": bar.start, "price": fill.price, "hi": fill.price, "lo": fill.price,
+                                  "signal": info.get("signal")}
                     risk.record_order()
                     trades_today += 1
                 elif pos:
@@ -151,6 +231,8 @@ def run_backtest(entry, trend, cfg, start_equity: float, lo: int = 0, hi: int | 
 
         # 2) did price hit the stop/target during this candle?
         if pos:
+            entry_info["hi"] = max(entry_info["hi"], bar.high)
+            entry_info["lo"] = min(entry_info["lo"], bar.low)
             hit = strat.intrabar_exit(bar.low, bar.high, pos)
             if hit:
                 reason, level = hit
@@ -172,7 +254,10 @@ def run_backtest(entry, trend, cfg, start_equity: float, lo: int = 0, hi: int | 
         if decision.action == BUY:
             ok, why = risk.check_entry(cfg.symbol, eq, pf.peak_equity, f.close_ms)
             if ok:
-                pending = (BUY, {"atr": f.atr})
+                pending = (BUY, {"atr": f.atr, "signal": {
+                    "rsi": round(f.rsi, 2), "atr_pct": round(f.atr / f.close, 5),
+                    "volume_ratio": round(f.volume / f.vol_ma, 3) if f.vol_ma else None,
+                    "trend_gap_pct": round(f.trend_fast / f.trend_slow - 1, 5)}})
             else:
                 for w in why:
                     res.blocked[w] = res.blocked.get(w, 0) + 1
