@@ -1,0 +1,4 @@
+# Milestone 8 (not built yet). Selecting this profile stops the program with a clear message.
+mode: exchange_demo
+trading_enabled: false
+live_trading_enabled: false

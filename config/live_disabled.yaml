@@ -1,0 +1,4 @@
+# Watch-only profile: reads the market and logs signals, but never trades.
+mode: simulator
+trading_enabled: false
+live_trading_enabled: false

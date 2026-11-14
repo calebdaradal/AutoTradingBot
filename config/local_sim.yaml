@@ -1,0 +1,4 @@
+# Default profile: real market prices, fake money, trades inside our own simulator.
+mode: simulator
+trading_enabled: true
+live_trading_enabled: false

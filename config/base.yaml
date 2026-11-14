@@ -1,0 +1,68 @@
+# Base settings. Profiles (local_sim / exchange_demo / live_disabled) override these.
+config_version: 1
+symbol: BTCUSDT
+category: spot              # spot only. No futures, margin, or leverage.
+mode: simulator             # simulator = fake money, real market prices
+live_trading_enabled: false # There is no live-order code in this project.
+trading_enabled: true       # false = only watch the market, never open trades
+
+data:
+  rest_url: https://api.bybit.com          # public market data, no key needed
+  ws_url: wss://stream.bybit.com/v5/public/spot
+  db_path: data/trading_bot.db
+  entry_interval: 15        # minutes - candle size used for entries
+  trend_interval: 60        # minutes - candle size used for the trend filter
+  warmup_candles: 300       # candles loaded at start so indicators are ready
+  quote_stale_seconds: 15   # price quote older than this = "stale" = no new trades
+  candle_stale_seconds: 120 # closed candle later than this after close = data problem
+  ws_ping_seconds: 20
+  reconnect_base_seconds: 1
+  reconnect_max_seconds: 60
+
+account:
+  starting_balance_php: 500   # virtual money (PHP) - nothing is deposited
+  fx_php_per_usdt: 58.0       # ASSUMPTION used only to convert PHP -> USDT. Update if needed.
+
+costs:                        # assumptions - always shown in reports
+  taker_fee: 0.001            # 0.10% per market order (Bybit standard spot tier)
+  half_spread: 0.0001         # backtest only (live uses the real bid/ask)
+  slippage: 0.0003            # extra 0.03% price worsening on every market order
+
+exchange_rules:               # from Bybit instruments-info for BTCUSDT spot
+  min_notional_usdt: 5.0
+  min_qty: 0.000001
+  qty_step: 0.000001
+
+strategy:
+  name: trend_momentum
+  version: "1.0"
+  ema_fast: 20
+  ema_slow: 50
+  rsi_period: 14
+  rsi_min: 50
+  rsi_max: 70
+  atr_period: 14
+  volume_ma_period: 20
+  volume_mult: 1.0            # volume must be >= this x its average
+  atr_pct_min: 0.0015         # skip if the market barely moves (0.15%)
+  atr_pct_max: 0.02           # skip if the market is too wild (2%)
+  stop_atr_mult: 2.0          # stop-loss = entry - 2 x ATR
+  target_atr_mult: 3.0        # take-profit = entry + 3 x ATR
+  max_hold_bars: 48           # sell after 48 x 15m = 12 hours at most
+  max_trades_per_day: 3
+  cooldown_bars: 4            # wait 4 x 15m after closing a trade
+
+risk:
+  allowed_symbols: [BTCUSDT]
+  risk_per_trade_pct: 0.02    # lose at most 2% of equity if the stop is hit
+  max_position_pct: 0.95      # never put more than 95% of equity in BTC
+  max_spread_pct: 0.0005      # skip if bid/ask gap > 0.05%
+  daily_loss_limit_pct: 0.05  # stop opening trades if down 5% today
+  max_drawdown_pct: 0.15      # stop opening trades if 15% below the best equity
+  max_orders_per_day: 6
+  max_consecutive_losses: 3   # after 3 losses in a row, pause...
+  loss_cooldown_hours: 12     # ...for 12 hours
+
+backtest:
+  train_frac: 0.5
+  validation_frac: 0.25       # the remaining 25% is the untouched final test
