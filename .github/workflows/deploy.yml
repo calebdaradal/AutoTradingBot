@@ -52,15 +52,3 @@ jobs:
           environment-variables: |
             IMAGE_TAG=${{ inputs.image_tag || github.sha }}
             DASHBOARD_BASIC_AUTH=${{ secrets.DASHBOARD_BASIC_AUTH }}
-
-  cleanup:
-    needs: deploy
-    runs-on: ubuntu-latest
-    permissions:
-      packages: write
-    steps:
-      - uses: actions/delete-package-versions@v5
-        with:
-          package-name: autotradingbot
-          package-type: container
-          min-versions-to-keep: 5
