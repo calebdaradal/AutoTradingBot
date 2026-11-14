@@ -5,6 +5,7 @@ ask the risk manager -> (maybe) place a simulated order -> save everything.
 Between candles: watch the live price so a stop-loss or target is caught quickly.
 """
 import queue
+import signal
 import time
 from dataclasses import asdict
 
@@ -91,6 +92,7 @@ class Runner:
 
     # ------------------------------------------------------------------ main loop
     def run(self, minutes: float | None = None):
+        self._listen_for_docker_stop()
         self.start()
         deadline = time.time() + minutes * 60 if minutes else None
         next_beat = time.time() + 10
@@ -111,6 +113,16 @@ class Runner:
             log.note("Stop requested (Ctrl+C)")
         finally:
             self.shutdown()
+
+    def _listen_for_docker_stop(self):
+        """Docker stops a container with SIGTERM (a 'please stop' signal). Treat it like Ctrl+C: save, then exit."""
+        def on_stop(signum, frame):
+            log.note("Stop requested (Docker/system shutdown)")
+            self._stop = True
+        try:
+            signal.signal(signal.SIGTERM, on_stop)
+        except ValueError:   # not the main thread (e.g. in tests); skip
+            pass
 
     def shutdown(self):
         if self.feed:

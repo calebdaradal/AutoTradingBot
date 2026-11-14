@@ -1,0 +1,66 @@
+name: Deploy
+
+on:
+  push:
+    branches: [main, master]
+    # Docs and tests never change what runs, so they must not restart the bot during the 30-day paper run
+    paths-ignore:
+      - "**.md"
+      - "tests/**"
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "Commit SHA to deploy (rollback). Leave empty to build current commit."
+        required: false
+
+env:
+  IMAGE: ghcr.io/calebdaradal/autotradingbot   # must be lowercase
+
+jobs:
+  build:
+    if: github.event_name == 'push' || inputs.image_tag == ''
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v5
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          push: true
+          provenance: false
+          tags: |
+            ${{ env.IMAGE }}:${{ github.sha }}
+            ${{ env.IMAGE }}:latest
+
+  deploy:
+    needs: build
+    if: always() && needs.build.result != 'failure'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: hostinger/deploy-on-vps@v2
+        with:
+          api-key: ${{ secrets.HOSTINGER_API_KEY }}
+          virtual-machine: ${{ vars.HOSTINGER_VM_ID }}
+          project-name: autotradingbot
+          environment-variables: |
+            IMAGE_TAG=${{ inputs.image_tag || github.sha }}
+            DASHBOARD_BASIC_AUTH=${{ secrets.DASHBOARD_BASIC_AUTH }}
+
+  cleanup:
+    needs: deploy
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+    steps:
+      - uses: actions/delete-package-versions@v5
+        with:
+          package-name: autotradingbot
+          package-type: container
+          min-versions-to-keep: 5

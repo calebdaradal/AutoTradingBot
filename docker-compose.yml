@@ -1,0 +1,43 @@
+# Two containers share one folder on the VPS (/var/lib/autotradingbot) so the dashboard reads what the bot writes.
+# The image is built by GitHub and only pulled here (no build: on the VPS).
+
+services:
+  bot:
+    image: ghcr.io/calebdaradal/autotradingbot:${IMAGE_TAG:-latest}
+    restart: unless-stopped
+    command: ["python", "-m", "trading_bot", "run"]
+    stop_grace_period: 30s          # time the bot gets to save its account before Docker force-stops it
+    volumes:
+      - /var/lib/autotradingbot/data:/app/data
+      - /var/lib/autotradingbot/logs:/app/logs
+
+  dashboard:
+    image: ghcr.io/calebdaradal/autotradingbot:${IMAGE_TAG:-latest}
+    restart: unless-stopped
+    command: ["python", "-m", "streamlit", "run", "src/trading_bot/dashboard.py", "--server.port", "8501"]
+    environment:
+      STREAMLIT_SERVER_ADDRESS: 0.0.0.0
+      STREAMLIT_SERVER_HEADLESS: "true"
+      STREAMLIT_BROWSER_GATHER_USAGE_STATS: "false"
+    volumes:
+      - /var/lib/autotradingbot/data:/app/data
+      - /var/lib/autotradingbot/logs:/app/logs
+    networks: [traefik-proxy]
+    labels:
+      - traefik.enable=true
+      - traefik.docker.network=traefik-proxy
+      # No domain: reached by the VPS IP (https://<vps-ip>/). "tls=true" with no certresolver = Traefik's own
+      # self-signed certificate (encrypted, but the browser shows a one-time warning).
+      # priority=1 = lowest, so any other app on this VPS that uses a domain name still wins.
+      - traefik.http.routers.autotradingbot.rule=PathPrefix(`/`)
+      - traefik.http.routers.autotradingbot.priority=1
+      - traefik.http.routers.autotradingbot.entrypoints=websecure
+      - traefik.http.routers.autotradingbot.tls=true
+      # ":?" = refuse to start if the password is missing, so the dashboard can never go live open
+      - traefik.http.routers.autotradingbot.middlewares=autotradingbot-auth
+      - traefik.http.middlewares.autotradingbot-auth.basicauth.users=${DASHBOARD_BASIC_AUTH:?set DASHBOARD_BASIC_AUTH}
+      - traefik.http.services.autotradingbot.loadbalancer.server.port=8501
+
+networks:
+  traefik-proxy:
+    external: true

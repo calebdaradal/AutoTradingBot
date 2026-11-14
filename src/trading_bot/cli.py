@@ -4,6 +4,7 @@
   backtest     replay the strategy on past data (train + validation + stress tests). The final test is LOCKED
                  --candidate <version> tests a new idea (needs a written hypothesis first)
   diagnose     facts about why the v1.0 baseline loses (reads its saved backtests)
+  diagnose-paper  the same facts, but for the real paper-trading run (reads its closed trades)
   hypothesis   add / list / close ideas. One at a time, written down before testing
   final-check  take the locked final test (needs --candidate and --confirm; only for a qualified candidate)
   experiments  list the saved receipts of past backtests
@@ -188,6 +189,18 @@ def cmd_diagnose(cfg, a):
     log.ok("Diagnosis done. These are measurements, not explanations. Ideas go in 'hypothesis add'.")
 
 
+def cmd_diagnose_paper(cfg, a):
+    from .diagnose import diagnose_trades, print_diagnosis
+    from .report import paper_trades
+    c = cfg.costs
+    round_trip = 2 * (c.taker_fee + c.half_spread + c.slippage)
+    trades = paper_trades(Database(cfg.data.db_path), cfg.symbol, cfg.data.entry_interval)
+    log.note(f"Why is the paper run winning or losing? Facts from its {len(trades)} closed trades "
+             f"(a round trip costs about {round_trip:.2%} of price).")
+    print_diagnosis("paper", diagnose_trades(trades, round_trip), log.note)
+    log.ok("Paper diagnosis done. These are measurements, not explanations. Ideas go in 'hypothesis add'.")
+
+
 def cmd_hypothesis(cfg, a):
     from . import hypotheses as hy
     db = Database(cfg.data.db_path)
@@ -330,6 +343,7 @@ def main(argv=None):
     sub.add_parser("status").set_defaults(fn=cmd_status)
     sub.add_parser("ops").set_defaults(fn=cmd_ops)
     d = sub.add_parser("diagnose"); d.add_argument("--version", default=None); d.set_defaults(fn=cmd_diagnose)
+    sub.add_parser("diagnose-paper").set_defaults(fn=cmd_diagnose_paper)
     sub.add_parser("kill").set_defaults(fn=cmd_kill)
     sub.add_parser("resume").set_defaults(fn=cmd_resume)
     sub.add_parser("dashboard").set_defaults(fn=cmd_dashboard)
