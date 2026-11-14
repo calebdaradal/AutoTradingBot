@@ -1,7 +1,7 @@
 # Milestone Handoff
 
 Source plan: `zero_budget_trading_bot_roadmap.md`
-Last updated: 2026-11-12
+Last updated: 2026-11-15
 Scope: BTC/USDT, spot only, **paper trading only** (fake money, real prices). No real-money code exists.
 
 Legend: **FINISHED** = built and tested. **NEXT** = work to do now. **NOT DONE** = not started.
@@ -17,7 +17,7 @@ Legend: **FINISHED** = built and tested. **NEXT** = work to do now. **NOT DONE**
 | M4 | Strategy (`trend_momentum` v1.0) | FINISHED | Every decision has a reason |
 | M5 | Backtester | FINISHED (built) - **gate NOT passed** | Strategy loses money out-of-sample |
 | M6 | Paper-trading simulator | FINISHED | Balances reconcile; rollback + restart tested |
-| M7 | MVP paper run + acceptance | **NEXT** | Software ready; needs 30+ days of paper results |
+| M7 | MVP paper run + acceptance | **RUNNING** (started 2026-11-15 on VPS) | Needs 30+ days AND 30+ closed trades |
 | M8 | Exchange demo API | NOT DONE | Stub raises `NotImplementedError` on purpose |
 | M9 | Order-flow features | NOT DONE | Optional |
 | M10 | Regime classifier | NOT DONE | Optional |
@@ -87,8 +87,8 @@ Legend: **FINISHED** = built and tested. **NEXT** = work to do now. **NOT DONE**
 | Daily loss limit disables entries | Done |
 | Dashboard shows net P&L and drawdown | Done (`dashboard`) |
 | Out-of-sample + benchmark evaluation | Done - **result negative** |
-| 30+ days of paper results, no rule changes | **NOT DONE - needs calendar time** |
-| All critical tests pass | Done (58 passing) |
+| 30+ days of paper results, no rule changes | **IN PROGRESS** - started 2026-11-15, earliest finish about 2026-12-15 |
+| All critical tests pass | Done (100 passing) |
 
 ## Research hardening (done after the gap report)
 - Backtester tests: `tests/unit/test_backtest.py` (14). Research tests: `tests/unit/test_research.py` (14). Total 58 passing.
@@ -127,8 +127,38 @@ The two tracks are kept apart on purpose. The paper run always uses frozen v1.0.
 ### Workflow
 `diagnose` -> register candidate class -> `hypothesis add` -> `backtest --candidate X` -> (if qualified) `final-check --candidate X --confirm`.
 
+## Dashboard and failure diagnosis (added 2026-11-15)
+- Dashboard now shows: profit factor, average trade/win/loss, longest losing streak, 30-day/30-trade gate progress, bot health, and a research section.
+- `diagnose-paper`: facts about why a paper run lost (exit reasons, costs, losers that were up first). Facts only, no rule changes.
+- Report helpers in `report.py`: `profit_factor`, `avg_trade/win/loss`, `max_losing_streak`, `paper_trades()`.
+- Diagnostic export (`export.py`, NOT yet deployed): `export-report` command and a "Download diagnostic report" button on the dashboard produce one text file (health flags, status, ops, diagnosis, frozen settings, warnings, trades, decisions, last 300 bot-log lines). The dashboard also has a live "Bot log / status / ops / diagnose-paper" tab section. Deploying it restarts the bot (small candle gap, log it as a restart).
+
+## Deployment on the VPS (added 2026-11-15)
+- Flow: push to `master` or `main` -> GitHub Actions builds the image -> GHCR (`ghcr.io/calebdaradal/autotradingbot`) -> Hostinger API -> Docker Manager runs `docker-compose.yml`.
+- Two containers: `autotradingbot-bot-1` (paper trading) and `autotradingbot-dashboard-1` (web UI). Data and logs live on the VPS in `/var/lib/autotradingbot/{data,logs}`, so they survive redeploys.
+- Dashboard access: `https://<vps-ip>/` through Traefik. No domain, so the browser shows a one-time certificate warning. Login is basic auth (`admin` + password).
+- The bot stops cleanly on Docker stop (SIGTERM): it saves state, then exits.
+- Files: `Dockerfile`, `.dockerignore`, `docker-compose.yml`, `.github/workflows/deploy.yml`.
+- Docs (`**.md`) and `tests/**` changes do NOT trigger a deploy. Any other push restarts the bot and creates gaps in the 30-day run.
+- Rollback or dashboard-only redeploy: Actions -> Deploy -> Run workflow, with `image_tag` set to the running commit SHA (the bot is not rebuilt).
+
+### Problems hit during first deploy (and fixes)
+| Problem | Cause | Fix |
+|---------|-------|-----|
+| "API key is required" | `HOSTINGER_API_KEY` saved as a variable, not a secret | Added as a secret, rotated the key |
+| Bot crash loop: `No module named 'trading_bot.data'` | `.gitignore` had `data/`, which also hid `src/trading_bot/data/` | Changed to `/data/`, committed the 4 missing files |
+| "unknown blob" on image push | The old cleanup job deleted registry pieces still in use | Removed the cleanup job |
+| Login rejected | The Hostinger action pastes secrets into a shell script, which ate the `$` in the password hash | Secret `DASHBOARD_BASIC_AUTH` stores the hash with `\$` instead of `$` |
+
+### Password change
+`docker run --rm httpd:2.4 htpasswd -nbB admin MYPASSWORD | sed 's/\$/\\$/g'`, paste the whole line into the `DASHBOARD_BASIC_AUTH` secret, then redeploy with `image_tag` set to the running commit.
+
+### Checking the run on the VPS
+- Logs: `docker logs autotradingbot-bot-1 2>&1 | tail -15`
+- Status: `docker exec autotradingbot-bot-1 python -m trading_bot ops` (also `status`, `diagnose-paper`, `kill`, `resume`)
+
 ## Next to implement
-1. **Start the paper run now** and leave it running. Do not change rules during the 30 days. Check with `ops` and `status`.
+1. **Paper run is live. Leave it alone.** Do not change rules or push code during the 30 days. Check with `ops`, `status` and the dashboard.
 2. Write the first hypothesis from the `diagnose` facts. Record every version, including failures.
 3. `verdict` in the report says "TOO EARLY" until 30 days and 30 trades.
 4. Only after a profitable, out-of-sample result: consider M8+.
@@ -150,6 +180,8 @@ Run from the project folder using `.venv\Scripts\python.exe -m trading_bot <comm
 | `experiments` | List saved backtest receipts (settings, data fingerprint, code version, results) |
 | `refreeze --reason "why"` | Accept changed settings for paper trading (treat as a new experiment) |
 | `run` | Start paper trading (live prices, fake money) |
+| `diagnose-paper` | Facts about why the paper run lost money (no rule changes) |
+| `export-report` | Save one readable diagnostic file into `logs/` |
 | `status` | Print account, open position, verdict |
 | `kill` | Emergency stop: no new buys, closes any open position |
 | `resume` | Clear the kill switch |

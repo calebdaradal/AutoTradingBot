@@ -13,6 +13,7 @@
   refreeze     accept changed settings for the paper run (needs --reason)
   status       show how the paper run is doing
   ops          health check of the paper run itself (feed, orders, missed candles, fill costs)
+  export-report  save one readable diagnostic file (status, health, diagnosis, trades, warnings, log tail)
   kill         emergency stop: block new buys and close any open position
   resume       clear the emergency stop / drawdown halt
   dashboard    open the visual dashboard (browser)
@@ -284,6 +285,12 @@ def cmd_ops(cfg, a):
     log.ok("Ops report done")
 
 
+def cmd_export_report(cfg, a):
+    from .export import write_report
+    path = write_report(Database(cfg.data.db_path), cfg)
+    log.ok(f"Diagnostic report saved: {path}")
+
+
 def cmd_kill(cfg, a):
     Database(cfg.data.db_path).set_state("kill_switch", True)
     log.warn("Emergency stop set. The running bot will close any open position and stop buying.")
@@ -342,6 +349,7 @@ def main(argv=None):
     rf.set_defaults(fn=cmd_refreeze)
     sub.add_parser("status").set_defaults(fn=cmd_status)
     sub.add_parser("ops").set_defaults(fn=cmd_ops)
+    sub.add_parser("export-report").set_defaults(fn=cmd_export_report)
     d = sub.add_parser("diagnose"); d.add_argument("--version", default=None); d.set_defaults(fn=cmd_diagnose)
     sub.add_parser("diagnose-paper").set_defaults(fn=cmd_diagnose_paper)
     sub.add_parser("kill").set_defaults(fn=cmd_kill)

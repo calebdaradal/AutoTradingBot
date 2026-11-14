@@ -13,6 +13,7 @@ from trading_bot import hypotheses as hy
 from trading_bot.config import DEFAULT_PROFILE, load_config, starting_balance_usdt
 from trading_bot.db import Database
 from trading_bot.diagnose import diagnose_trades, print_diagnosis
+from trading_bot.export import build_report, command_outputs, tail_log
 from trading_bot.ops import GATE_DAYS, GATE_TRADES, ops_flags, ops_report
 from trading_bot.report import paper_report, paper_trades, verdict
 from trading_bot.research import invalid_experiments
@@ -31,6 +32,10 @@ st.set_page_config(page_title="Paper Trading Dashboard", layout="wide")
 st.title("Paper trading dashboard (pretend money)")
 st.caption(f"Real market prices, fake money. Nothing here can place a real order. "
            f"Updates by itself every {REFRESH_SECONDS} seconds.")
+st.download_button("Download diagnostic report (one file)", data=lambda: build_report(db, cfg).encode("utf-8"),
+                   file_name="diagnostic-report.txt", mime="text/plain",
+                   key="export_report", on_click="ignore",
+                   help="One readable text file: status, health, diagnosis, trades, warnings and the bot log. Send it to your assistant to diagnose.")
 
 
 @st.fragment(run_every=REFRESH_SECONDS)
@@ -120,6 +125,16 @@ def live_view():
     print_diagnosis("paper", diagnose_trades(paper_trades(db, cfg.symbol, cfg.data.entry_interval),
                                              2 * (cst.taker_fee + cst.half_spread + cst.slippage)), lines.append)
     st.text("\n".join(lines))
+
+    st.subheader("Live command output and bot log (no SSH needed)")
+    cmds = command_outputs(db, cfg)
+    tabs = st.tabs(["Bot log", "status", "ops", "diagnose-paper"])
+    with tabs[0]:
+        st.caption("Newest lines are at the bottom. Times are UTC.")
+        st.code("\n".join(tail_log(lines=150)) or "No log lines yet.", language=None, height=400)
+    for tab, name in zip(tabs[1:], ("status", "ops", "diagnose-paper")):
+        with tab:
+            st.code("\n".join(cmds[name]) or "Nothing yet.", language=None)
 
     st.subheader("Strategy research (ideas being tested, separate from this paper run)")
     hyps = hy.list_hypotheses(db)
